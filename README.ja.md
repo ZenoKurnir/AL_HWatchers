@@ -27,7 +27,7 @@ Hが始まると、同じマップにいる女の子たちが二人のまわり�
 
 ## インストール
 
-1. [Releases](../../releases) ページから `AL_HWatchers-v1.0.0.zip` をダウンロードします。
+1. [Releases](../../releases) ページから `AL_HWatchers-v1.0.1.zip` をダウンロードします。
 2. ゲームフォルダ（`AmanatsuLocation.exe` のあるフォルダ）に展開し、`BepInEx/plugins/AL_HWatchers.dll` となるようにします。
 3. ゲームを起動します。
 

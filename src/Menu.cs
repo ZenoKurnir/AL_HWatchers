@@ -15,7 +15,10 @@ public class WatcherMenu : MonoBehaviour
     private static readonly string[] StateNames = { "on", "half", "off" };
     private static readonly string[] OutfitNames = { "Swimsuit", "After bath" };
 
-    private static Vector2 _scroll;
+    private static float _scroll;       // how far the menu is scrolled down, in pixels
+    private static bool _blocked;
+    private static Rect _box;
+    private static float _contentHeight; // measured on the last repaint; 0 until known
     private Vector3 _downAt;
     private bool _down;
 
@@ -36,6 +39,9 @@ public class WatcherMenu : MonoBehaviour
         try { Watchers.WatchEnd(); Watchers.WatchSlots(); } catch { }
         try
         {
+            // The mouse wheel over the menu scrolls it.
+            if (Watchers.Selected != null && _box.Contains(new Vector2(Input.mousePosition.x, Screen.height - Input.mousePosition.y)))
+                _scroll -= Input.mouseScrollDelta.y * 40f;
             // Ctrl must be held, so turning the camera with the right button can't open a menu by accident.
             var ctrl = Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl);
             if (Input.GetMouseButtonDown(1) && ctrl) { _downAt = Input.mousePosition; _down = true; }
@@ -54,17 +60,38 @@ public class WatcherMenu : MonoBehaviour
     {
         var w = Watchers.Selected;
         if (w?.Human == null) return;
-        try { Draw(w); }
+        var areas = 0;
+        try { Draw(w, ref areas); }
         catch (Exception e) { Plugin.Log.LogWarning($"Menu failed: {e.Message}"); Watchers.Selected = null; }
+        finally
+        {
+            // Close any area still open after an error, so Unity's GUI clips stay balanced.
+            for (; areas > 0; areas--) try { GUILayout.EndArea(); } catch { }
+        }
     }
 
-    private static void Draw(Watcher w)
+    // Scrolling is done by hand (an inner area moved up inside the outer one, driven by the mouse wheel):
+    // GUILayout.BeginScrollView is stripped from the game and can't be restored on every BepInEx build.
+    private static void Draw(Watcher w, ref int areas)
     {
-        const float width = 270f;
+        const float width = 270f, closeHeight = 30f, pad = 6f;
         // It ends well above the bottom right corner, where the game's move tool opens; long menus scroll.
         var height = Mathf.Max(300f, Screen.height * 0.58f - 120f);
-        GUILayout.BeginArea(new Rect(Screen.width - width - 20f, 120f, width, height), GUI.skin.box);
-        _scroll = GUILayout.BeginScrollView(_scroll, None);
+        var box = new Rect(Screen.width - width - 20f, 120f, width, height);
+        GUI.Box(box, "");
+        var view = height - closeHeight - pad * 3f;
+        var max = Mathf.Max(0f, _contentHeight - view);
+        var mouse = new Vector2(Input.mousePosition.x, Screen.height - Input.mousePosition.y);
+        _box = box;
+        _scroll = Mathf.Clamp(_scroll, 0f, max);
+
+        var viewRect = new Rect(box.x + pad, box.y + pad, width - pad * 2f, view);
+        // Buttons scrolled out of sight must not catch clicks meant for the Close button or the game.
+        var e = Event.current.type;
+        _blocked = (e == EventType.MouseDown || e == EventType.MouseUp) && !viewRect.Contains(mouse);
+        GUI.enabled = !_blocked;
+        GUILayout.BeginArea(viewRect); areas++;
+        GUILayout.BeginArea(new Rect(0f, -_scroll, width - pad * 2f - (max > 0f ? 8f : 0f), Mathf.Max(view, _contentHeight) + 2000f)); areas++;
         GUILayout.Label($"<b>{w.Name}</b>{(w.SecondGirl ? "  (second girl)" : "")}", None);
         GUILayout.Label(w.Hearts >= 0 ? $"Hearts: {w.Hearts}" : "Hearts: ?", None);
         if (w.Locked) GUILayout.Label("She only watches: no options with 0 hearts.", None);
@@ -74,7 +101,7 @@ public class WatcherMenu : MonoBehaviour
             ? "<i>The move tool (bottom right) now moves her.</i>"
             : w.Gathered ? "" : "<i>Open the move tool (bottom right) to move her.</i>", None);
 
-        GUI.enabled = !w.Locked;
+        GUI.enabled = !w.Locked && !_blocked;
 
         var busy = w.Lover != null || w.Gathered;
         var outfit = Watchers.Outfit(w);
@@ -148,8 +175,19 @@ public class WatcherMenu : MonoBehaviour
         if (GUILayout.Button("Send her back", None)) Watchers.Dismiss(w);
 
         GUI.enabled = true;
-        GUILayout.EndScrollView();
-        if (GUILayout.Button("Close", None)) Watchers.Selected = null;
-        GUILayout.EndArea();
+        // Where the content ends, measured on repaint, sets how far it can scroll.
+        // (GetRect, not GetLastRect: that one is stripped from the game too.)
+        var end = GUILayoutUtility.GetRect(0f, 0f, GUI.skin.label, None);
+        if (Event.current.type == EventType.Repaint) _contentHeight = end.y;
+        GUILayout.EndArea(); areas--;
+        GUILayout.EndArea(); areas--;
+        if (max > 0f)
+        {
+            // A thin bar showing where in the menu she is.
+            var track = new Rect(box.xMax - pad - 6f, box.y + pad, 4f, view);
+            var thumb = Mathf.Max(20f, view * view / _contentHeight);
+            GUI.Box(new Rect(track.x, track.y + (view - thumb) * (_scroll / max), track.width, thumb), "");
+        }
+        if (GUI.Button(new Rect(box.x + pad, box.yMax - pad - closeHeight, width - pad * 2f, closeHeight), "Close")) Watchers.Selected = null;
     }
 }

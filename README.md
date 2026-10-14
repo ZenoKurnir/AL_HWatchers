@@ -27,7 +27,7 @@ When H starts, girls from the current map gather around the couple and watch. As
 
 ## Installation
 
-1. Download `AL_HWatchers-v1.0.0.zip` from the [Releases](../../releases) page.
+1. Download `AL_HWatchers-v1.0.1.zip` from the [Releases](../../releases) page.
 2. Extract it into the game folder (the one with `AmanatsuLocation.exe`), so you end up with `BepInEx/plugins/AL_HWatchers.dll`.
 3. Start the game.
 
