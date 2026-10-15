@@ -25,6 +25,23 @@ internal static class Hooks
     }
 }
 
+// A worn-out girl can't join a 3P (it has no tired positions): while the girl waiting to join is tired, the
+// position menu leaves out the positions that need her. Patched on its own so a miss can't stop the main hooks.
+internal static class TiredHooks
+{
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(PostureMainSelecter), nameof(PostureMainSelecter.CheckPosture))]
+    public static void CheckPosture_Post(int category, ref bool __result)
+    {
+        try
+        {
+            if (__result && (category == (int)Define.PostureCategory.M1F2 || category == (int)Define.PostureCategory.Les) && Watchers.WaitingGirlTired())
+                __result = false;
+        }
+        catch { }
+    }
+}
+
 // After a swap, the H clothes menu is redrawn from her current clothes once a button is pressed, so its marks
 // match the girl now in the slot. Patched on its own so a miss can't stop the main hooks.
 internal static class MenuHooks

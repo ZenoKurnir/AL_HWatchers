@@ -14,6 +14,8 @@ namespace AL_HWatchers;
 internal static class Solo
 {
     private static readonly List<(NPCData npc, int was)> _links = new();
+    private static float _pairedAt;
+    private static bool _inScene;
 
     internal static void Before(EventManager.Parameter param, string where)
     {
@@ -26,16 +28,20 @@ internal static class Solo
             var link = data.Action.LinkPartnerUniqueID;
             var game = Manager.Game.Instance;
             var partner = link != 0 && link != -1 ? game?.GetHeroin_UniqueID(link) : null;
-            Plugin.Debug($"Solo H ({where}): {name}, partner link {link}{(partner != null ? $" ({Name(partner.Data)}, here)" : " (none here)")}.");
+            // Links left from an H that was agreed to but never started (she said no, or it was called off) are put
+            // back first; otherwise no later H could get a second girl.
+            if (_links.Count > 0 && !_inScene && Time.realtimeSinceStartup - _pairedAt > 180f) End("left from an H that never started");
+            Plugin.Log.LogInfo($"Solo H ({where}): {name}, partner link {link}{(partner != null ? $" ({Name(partner.Data)}, here)" : " (none here)")}{(_links.Count > 0 ? ", already paired for this H" : "")}.");
             if (!Plugin.SoloSecondGirl.Value || partner != null || _links.Count > 0) return;
 
             var pick = Pick(her);
-            if (pick == null) { Plugin.Debug("Solo H: no other girl with hearts to pair her with."); return; }
+            if (pick == null) { Plugin.Log.LogInfo("Solo H: no other girl with hearts to pair her with."); return; }
             _links.Add((data, link));
             _links.Add((pick.Data, pick.Data.Action.LinkPartnerUniqueID));
             data.Action.LinkPartnerUniqueID = pick.Data.UniqueID;
             pick.Data.Action.LinkPartnerUniqueID = data.UniqueID;
-            Plugin.Debug($"Solo H: {name} is paired with {Name(pick.Data)} for this H.");
+            _pairedAt = Time.realtimeSinceStartup;
+            Plugin.Log.LogInfo($"Solo H: {name} is paired with {Name(pick.Data)} for this H.");
         }
         catch (Exception e) { Plugin.Log.LogWarning($"Solo H ({where}): {e.Message}"); }
     }
@@ -71,7 +77,7 @@ internal static class Solo
             try { if (hasHuman) score += (h.Human.GameObject.transform.position - at).sqrMagnitude; else score += 1e5f; } catch { score += 1e5f; }
             if (score < bestScore) { bestScore = score; best = h; }
         }
-        Plugin.Debug($"Solo H: map {mapId}, girls: {(seen.Count > 0 ? string.Join("; ", seen) : "none")}.");
+        Plugin.Log.LogInfo($"Solo H: map {mapId}, girls: {(seen.Count > 0 ? string.Join("; ", seen) : "none")}.");
         return best;
     }
 
@@ -79,6 +85,7 @@ internal static class Solo
 
     internal static void AtStart(HScene scene)
     {
+        _inScene = true;
         try
         {
             var hs = scene._parameter_k__BackingField.Humans;
@@ -91,13 +98,20 @@ internal static class Solo
         catch { }
     }
 
-    internal static void End()
+    internal static void End(string why = "H ended")
     {
+        _inScene = false;
         if (_links.Count == 0) return;
         foreach (var (npc, was) in _links)
             try { npc.Action.LinkPartnerUniqueID = was; } catch { }
-        Plugin.Debug("Solo H: the girls' partner links are back as they were.");
+        Plugin.Log.LogInfo($"Solo H: the girls' partner links are back as they were ({why}).");
         _links.Clear();
+    }
+
+    // Pairing done for an H that never started is undone after a while, so it can't stay in the save.
+    internal static void Tick()
+    {
+        if (_links.Count > 0 && !_inScene && Time.realtimeSinceStartup - _pairedAt > 180f) End("H never started");
     }
 }
 

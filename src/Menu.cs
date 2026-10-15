@@ -36,7 +36,7 @@ public class WatcherMenu : MonoBehaviour
     private void Update()
     {
         TokLibrary.ImportIfNeeded();
-        try { Watchers.WatchEnd(); Watchers.WatchSlots(); } catch { }
+        try { Watchers.WatchEnd(); Watchers.WatchSlots(); Solo.Tick(); } catch { }
         try
         {
             // The mouse wheel over the menu scrolls it.
@@ -161,8 +161,10 @@ public class WatcherMenu : MonoBehaviour
             if (targets.Count > 0)
             {
                 GUILayout.Space(6f);
+                if (w.Tired && Watchers.In3P()) GUILayout.Label("She's too worn out to join a 3P.", None);
                 foreach (var (index, name, active) in targets)
                 {
+                    if (!Watchers.CanSwapInto(w, active)) continue;
                     if (active && GUILayout.Button($"Swap with {name}", None)) { Watchers.SwapIn(w, index); break; }
                     if (!active && !w.SecondGirl && GUILayout.Button("Make her the 3P girl", None)) { Watchers.SwapIn(w, index); break; }
                 }

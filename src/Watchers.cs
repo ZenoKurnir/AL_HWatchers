@@ -205,6 +205,8 @@ internal static partial class Watchers
         w.Voice = null;
         try { w.Hearts = w.Data.GameParameter.Favorability.LV; } catch { w.Hearts = -1; }
         MatchOutfit(w);
+        // What she had on when she was last in the scene (or watching, before she joined).
+        DressAsRemembered(w.Id, w.Human);
         var anim = w.Human.Body?.animBody;
         if (anim != null)
         {
@@ -234,6 +236,8 @@ internal static partial class Watchers
         {
             if (!w.Away && active.Contains(w.Id))
             {
+                RememberClothes(w.Id, w.Human);
+                NoteJoining(w.Id);
                 Dispose(w);
                 w.Away = true;
                 Plugin.Debug($"{w.Name} joined the scene; her spot waits for her.");
@@ -242,6 +246,7 @@ internal static partial class Watchers
             {
                 // After a swap the girl may already be watching in another spot: no second copy of her.
                 if (_list.Any(o => o != w && !o.Away && o.Id == w.Id)) { _list.Remove(w); continue; }
+                NoteLeaving(w.Id);
                 Spawn(scene, w);
             }
         }

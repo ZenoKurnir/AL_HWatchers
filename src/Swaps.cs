@@ -39,8 +39,52 @@ internal static partial class Watchers
     // both last until the scene ends.
     private static readonly Dictionary<int, int> _outfits = new();
     private static readonly HashSet<int> _tired = new();
+    // What each girl had on, piece by piece, when she last changed places, so she keeps it wherever she goes.
+    private static readonly Dictionary<int, Dictionary<HumanCloth.Define.ClothesKind, HumanCloth.Define.ClothesState>> _clothes = new();
+    // A girl joining the 3P as herself (her slot was never rebuilt) gets her clothes from watching once she is in.
+    private static readonly Dictionary<int, (int id, float since)> _dressOnJoin = new();
 
-    private static void ResetMemory() { _outfits.Clear(); _tired.Clear(); }
+    private static void ResetMemory() { _outfits.Clear(); _tired.Clear(); _clothes.Clear(); _dressOnJoin.Clear(); _mainIndex = -1; }
+
+    private static Dictionary<HumanCloth.Define.ClothesKind, HumanCloth.Define.ClothesState> ReadClothes(Human h)
+    {
+        var clothes = new Dictionary<HumanCloth.Define.ClothesKind, HumanCloth.Define.ClothesState>();
+        try
+        {
+            foreach (HumanCloth.Define.ClothesKind kind in Enum.GetValues(typeof(HumanCloth.Define.ClothesKind)))
+                if (h.Cloth.IsClothesStateKind(kind)) clothes[kind] = h.Cloth.GetClothesStateType(kind);
+        }
+        catch { }
+        return clothes;
+    }
+
+    private static void RememberClothes(int id, Human h)
+    {
+        if (h?.Cloth == null) return;
+        var clothes = ReadClothes(h);
+        if (clothes.Count == 0) return;
+        _clothes[id] = clothes;
+        Plugin.Debug($"Clothes kept for girl {id}: {string.Join(", ", clothes.Select(kv => $"{kv.Key}={kv.Value}"))}.");
+    }
+
+    // Puts on what she had, piece by piece. A piece without that state (no half-off look) comes off instead.
+    internal static void DressAsRemembered(int id, Human h)
+    {
+        if (h?.Cloth == null || !_clothes.TryGetValue(id, out var clothes)) return;
+        foreach (var (kind, state) in clothes)
+        {
+            try
+            {
+                if (!h.Cloth.IsExist(kind)) continue;
+                var st = state;
+                var kinds = h.Cloth.GetClothesStateKind(kind);
+                if (st != HumanCloth.Define.ClothesState.Clothing && kinds != null && !kinds.ContainsKey(st))
+                    st = kinds.ContainsKey(HumanCloth.Define.ClothesState.Naked) ? HumanCloth.Define.ClothesState.Naked : HumanCloth.Define.ClothesState.Clothing;
+                if (h.Cloth.GetClothesStateType(kind) != st) h.Cloth.SetClothesState(kind, st, true);
+            }
+            catch { }
+        }
+    }
 
     // The girls of the scene the menu can swap with: (actor index, the girl it shows, whether it is the 3P slot).
     public static List<(int index, string name, bool active)> SwapTargets()
@@ -66,6 +110,42 @@ internal static partial class Watchers
     public static bool CanSwap(Watcher w) =>
         Plugin.Swaps.Value && w?.Human != null && !w.Locked && !_wasPut && w.Data != null;
 
+    // The 3P has no tired positions, so a tired girl can't be the 3P girl or join while two girls are in the scene;
+    // she can only take the place of the girl alone with him.
+    public static bool CanSwapInto(Watcher w, bool active) => !w.Tired || (active && !In3P());
+
+    // Two girls in the scene at once (3P, or the girls together).
+    internal static bool In3P()
+    {
+        var n = 0;
+        try
+        {
+            var actors = _scene?.Actors;
+            for (var i = 0; actors != null && i < actors.Length; i++)
+                if (actors[i] != null && actors[i].Active && !actors[i].IsManOrFutanari) n++;
+        }
+        catch { }
+        return n >= 2;
+    }
+
+    // The girl who would join if the scene went to 3P is worn out: the 3P positions are not offered.
+    internal static bool WaitingGirlTired()
+    {
+        if (_tired.Count == 0 || _scene == null) return false;
+        try
+        {
+            var actors = _scene.Actors;
+            for (var i = 0; i < actors.Length; i++)
+            {
+                var a = actors[i];
+                if (a == null || a.Active || a.IsManOrFutanari || a.NPCData == null) continue;
+                if (_tired.Contains(ShownId(i, a))) return true;
+            }
+        }
+        catch { }
+        return false;
+    }
+
     public static void StandUp(Watcher w) { if (w.Gathered) EndGather(w); }
 
     private static int ShownId(int index, HActor a) =>
@@ -87,6 +167,11 @@ internal static partial class Watchers
         var actors = _scene.Actors;
         if (index < 0 || index >= actors.Length || actors[index]?.Human == null) return;
         var actor = actors[index];
+        if (!CanSwapInto(w, actor.Active))
+        {
+            Plugin.Debug($"{w.Name} is worn out: she can't join a 3P.");
+            return;
+        }
         var outId = ShownId(index, actor);
         var outNpc = FindNpc(outId);
         if (outNpc == null) { Plugin.Log.LogWarning($"Swap: no save data for girl {outId}."); return; }
@@ -101,7 +186,12 @@ internal static partial class Watchers
         var inOutfit = Outfit(w);
         if (inOutfit >= 0) _outfits[inNpc.UniqueID] = inOutfit;
         if (actor.Active) try { _outfits[outId] = (int)actor.Human.FileStatus.coordinateType; } catch { }
+        // And the clothes: the girl coming in keeps what she had on watching, the girl going out what she had on in H.
+        RememberClothes(inNpc.UniqueID, w.Human);
+        if (actor.Active) RememberClothes(outId, actor.Human);
 
+        // A tired girl can't wait as the 3P girl: if she would end up in that slot, another watcher takes it.
+        var outTired = actor.Active && (_tired.Contains(outId) || SafeB(() => actor.IsWeakness));
         // The same screen fade the game uses when the position changes, so the girls trade places behind it.
         if (actor.Active) try { HScene.CrossFadeStart(); } catch { }
         if (!Show(index, inNpc)) return;
@@ -111,9 +201,19 @@ internal static partial class Watchers
             // She was the girl in the scene: the girl who comes in leaves her spot to her. If the girl coming in
             // was waiting as the 3P girl, the girl going out takes that slot instead, so nobody is in it twice.
             var wasSecond = w.SecondGirl;
+            Watcher instead = null;
             for (var i = 0; i < actors.Length; i++)
                 if (i != index && actors[i]?.Human != null && !actors[i].IsManOrFutanari && ShownId(i, actors[i]) == inNpc.UniqueID)
-                    Show(i, outNpc);
+                {
+                    instead = outTired ? RestedSecondGirl(w, actors[i], inNpc.UniqueID, outNpc.UniqueID) : null;
+                    Show(i, instead?.Data ?? outNpc);
+                }
+            if (instead != null)
+            {
+                instead.SecondGirl = true;
+                wasSecond = false;
+                Plugin.Debug($"{outName} is worn out, so {instead.Name} is the 3P girl now.");
+            }
             // The entry keeping the 3P girl's spot now stands for the girl who came in, so the one going out
             // isn't brought back a second time when the 3P ends.
             foreach (var o in _list)
@@ -137,6 +237,15 @@ internal static partial class Watchers
         }
     }
 
+    // A watcher who can wait as the 3P girl instead of a tired one: the slot's own girl if she is watching, else any.
+    private static Watcher RestedSecondGirl(Watcher swapping, HActor slot, int inId, int outId)
+    {
+        var own = slot.NPCData?.UniqueID ?? 0;
+        return _list.Where(o => o != swapping && !o.Away && o.Human != null && !o.Tired && !o.Locked && o.Data != null
+                                && o.Id != inId && o.Id != outId && !_tired.Contains(o.Id))
+            .OrderBy(o => o.Id == own ? 0 : 1).FirstOrDefault();
+    }
+
     private static void Retarget(Watcher o, NPCData npc)
     {
         o.Data = npc;
@@ -148,6 +257,7 @@ internal static partial class Watchers
     // The 3P slot waiting to be rebuilt: done the moment she joins.
     public static void WatchSlots()
     {
+        DressJoiners();
         if (_slots.Count == 0 || _scene == null) return;
         foreach (var slot in _slots.Values.ToList())
         {
@@ -175,6 +285,56 @@ internal static partial class Watchers
             var npc = FindNpc(slot.ShownId);
             if (npc != null) Apply(slot, npc);
         }
+    }
+
+    // A girl who joins the 3P as herself is dressed by the game as she comes in; once she is in, she gets what she
+    // had on watching.
+    internal static void NoteJoining(int id)
+    {
+        if (_scene == null || !_clothes.ContainsKey(id)) return;
+        try
+        {
+            var actors = _scene.Actors;
+            for (var i = 0; i < actors.Length; i++)
+                if (actors[i] != null && !actors[i].IsManOrFutanari && actors[i].NPCData != null && ShownId(i, actors[i]) == id
+                    && !(_slots.TryGetValue(i, out var s) && s.ShownId != s.OriginalId))
+                    _dressOnJoin[i] = (id, -1f);
+        }
+        catch { }
+    }
+
+    private static void DressJoiners()
+    {
+        if (_dressOnJoin.Count == 0 || _scene == null) return;
+        foreach (var (index, (id, since)) in _dressOnJoin.ToList())
+        {
+            try
+            {
+                var a = _scene.Actors[index];
+                if (a?.Human?.GameObject == null || !a.Active || !a.Human.GameObject.activeInHierarchy) continue;
+                var now = Time.realtimeSinceStartup;
+                if (since < 0f) { _dressOnJoin[index] = (id, now); continue; }
+                if (now - since < 0.6f) continue;
+                _dressOnJoin.Remove(index);
+                DressAsRemembered(id, a.Human);
+                Plugin.Debug($"Slot {index}: dressed as she was watching.");
+            }
+            catch { _dressOnJoin.Remove(index); }
+        }
+    }
+
+    // What the girl at this slot has on as she leaves the scene, for when she watches again.
+    internal static void NoteLeaving(int id)
+    {
+        if (_scene == null) return;
+        try
+        {
+            var actors = _scene.Actors;
+            for (var i = 0; i < actors.Length; i++)
+                if (actors[i]?.Human != null && !actors[i].IsManOrFutanari && actors[i].NPCData != null && ShownId(i, actors[i]) == id)
+                { RememberClothes(id, actors[i].Human); return; }
+        }
+        catch { }
     }
 
     // Rebuilds the actor at this slot as the given girl (later, if she isn't in the scene yet).
@@ -284,6 +444,10 @@ internal static partial class Watchers
             foreach (var k in clothes.Keys.ToList()) clothes[k] = HumanCloth.Define.ClothesState.Clothing;
             foreach (var k in siru.Keys.ToList()) siru[k] = Human.SiruLv.None;
         }
+        // She comes in wearing what she had on (as a watcher, or when she was last in the scene), not what the
+        // girl before her had on.
+        else if (_clothes.TryGetValue(npc.UniqueID, out var own))
+            clothes = new Dictionary<HumanCloth.Define.ClothesKind, HumanCloth.Define.ClothesState>(own);
         foreach (var kv in clothes.ToList())
         {
             try
@@ -386,7 +550,7 @@ internal static partial class Watchers
         Plugin.Debug($"Swap slot {index}: height (stored, height, live) before {heightBefore}, after ({actor._realHeight:0.###}, {SafeF(() => actor.Height):0.###}, {SafeF(() => actor.RealTimeHeight):0.###}); " +
                            $"animator floats {AnimFloats(h.Body?.animBody)}.");
         Revoice(actor);
-        if (actor.Active && !_ending) { SetTired(actor, _tired.Contains(npc.UniqueID)); RefitPosture(); Blend(slot); }
+        if (actor.Active && !_ending) { NoteMain(); var tired = SyncTired(index); RefitPosture(tired); Blend(slot); }
         Plugin.Debug($"Swap slot {index} now shows {SafeName(() => npc.HumanData.Parameter.fullname)} " +
                            $"(personality {actor.Personality}, pitch {actor.VoicePitch:0.00}, {(Time.realtimeSinceStartup - t0) * 1000:0} ms).");
         return true;
@@ -469,44 +633,113 @@ internal static partial class Watchers
     }
 
     // The position again, so the motions are the ones for her height (the game picks them when it sets one up).
-    private static void RefitPosture()
+    // A tired girl alone with him goes to a tired position; a girl who isn't tired leaves one.
+    private static void RefitPosture(bool tired)
     {
         try
         {
             var info = _scene.NowAnimationInfo;
             if (info == null) return;
-            var (id, mode) = (info.ID, info.Mode);
-            _scene.ChangePosture(mode, id, _scene.IsWeakness, false);
+            var (mode, id) = PostureFor(info, tired);
+            _scene.ChangePosture(mode, id, tired, false);
             var after = _scene.NowAnimationInfo;
             var actors = _scene.Actors;
             for (var i = 0; i < actors.Length; i++)
                 if (actors[i] != null && actors[i].Active)
                     Plugin.Debug($"Swap: actor {i} ({actors[i].Name}) height {SafeF(() => actors[i].Height):0.###}, animator floats {AnimFloats(actors[i].Human?.Body?.animBody)}.");
-            Plugin.Debug($"Swap: position set up again: {info.NameAnimation} (mode {mode}, id {id}) -> {after?.NameAnimation} (mode {after?.Mode ?? -1}, id {after?.ID ?? -1}).");
+            Plugin.Debug($"Swap: position set up again{(tired ? " (tired)" : "")}: {info.NameAnimation} (mode {info.Mode}, id {info.ID}) -> {after?.NameAnimation} (mode {after?.Mode ?? -1}, id {after?.ID ?? -1}).");
         }
         catch (Exception e) { Plugin.Log.LogWarning($"Swap: setting the position up again failed: {e.Message}"); }
+    }
+
+    // The game marks its exhausted positions with 脱力 ("gone limp").
+    private static bool IsTiredPosture(AL.H.List.AnimationListInfo info) => (info?.NameAnimation ?? "").Contains("脱力");
+
+    // Which position fits her: the current one if it suits her state, else its tired (or rested) version, else one
+    // of the same kind, else any position for one girl that the game offers for her state.
+    private static (int mode, int id) PostureFor(AL.H.List.AnimationListInfo info, bool tired)
+    {
+        var keep = (info.Mode, info.ID);
+        if (tired == IsTiredPosture(info) && (!tired || info.PromiscuityType == PromiscuityType.MF)) return keep;
+        try
+        {
+            HActor main = null;
+            var actors = _scene.Actors;
+            for (var i = 0; i < actors.Length && main == null; i++)
+                if (actors[i] != null && actors[i].Active && !actors[i].IsManOrFutanari) main = actors[i];
+            var table = _scene.ResourceData?.GetPostureInfo(tired, _scene.PlaceCtrl, main?.NPCData?.GameParameter);
+            if (table == null) { Plugin.Debug("Swap: no position list for her state."); return keep; }
+            AL.H.List.AnimationListInfo best = null;
+            var bestScore = int.MaxValue;
+            var offered = 0;
+            foreach (var cat in table)
+            {
+                if (cat.Value == null) continue;
+                foreach (var entry in cat.Value)
+                {
+                    var x = entry.Value;
+                    if (x == null) continue;
+                    offered++;
+                    if (tired && x.PromiscuityType != PromiscuityType.MF) continue;
+                    if (!tired && x.PromiscuityType != info.PromiscuityType) continue;
+                    var sameKind = x.Mode == info.Mode;
+                    var twin = tired ? x.ID == info.WeaknessID : x.WeaknessID == info.ID;
+                    var score = (sameKind && twin ? 0 : sameKind ? 2 : 4) + (tired == IsTiredPosture(x) ? 0 : 1);
+                    if (score < bestScore) { bestScore = score; best = x; }
+                }
+            }
+            Plugin.Debug($"Swap: {offered} positions offered {(tired ? "tired" : "rested")}; for {info.NameAnimation} picked {best?.NameAnimation ?? "none"}.");
+            return best != null ? (best.Mode, best.ID) : keep;
+        }
+        catch (Exception e)
+        {
+            Plugin.Log.LogWarning($"Swap: finding a position for her state failed: {e.Message}");
+            return keep;
+        }
     }
 
     private static bool _ending;
 
     public static void EndScene() { RestoreSlots(false); ResetMemory(); }
 
-    // The girl coming in is tired only if she got tired earlier in this scene. Tiredness is kept per girl
-    // (hStatus) and, for the main girl, in the scene's counter that picks the tired positions.
-    private static void SetTired(HActor actor, bool tired)
+    // Tiredness belongs to each girl, not to the scene. The game keeps it per actor (hStatus) and, for the main
+    // girl, in the scene's counter, and treats the whole scene as tired if any actor is, the waiting 3P girl too;
+    // so after a swap every girl's flag is set from who really got tired, and nobody catches it from another.
+    // Returns whether the main girl is tired now.
+    private static bool SyncTired(int swapped)
     {
+        var mainTired = false;
         try
         {
-            var before = $"{SafeB(() => actor.IsWeakness)}/{SafeB(() => _scene.IsWeakness)}";
-            actor.hStatus?.SetWeakness(tired);
-            var main = false;
+            var before = $"{SafeB(() => _scene.IsWeakness)}";
             var actors = _scene.Actors;
+            // The 3P has no tired positions: with two girls in the scene nobody counts as tired, or the game drops
+            // the 3P for a tired scene with the main girl.
+            var threeP = In3P();
+            // A girl the game wore out in this scene (not the slot just rebuilt: its flag is still the last girl's).
+            for (var i = 0; i < actors.Length && !threeP; i++)
+            {
+                var a = actors[i];
+                if (i != swapped && a != null && a.Active && !a.IsManOrFutanari && a.NPCData != null && SafeB(() => a.IsWeakness))
+                    _tired.Add(ShownId(i, a));
+            }
+            var main = true;
+            var parts = new List<string>();
             for (var i = 0; i < actors.Length; i++)
-                if (actors[i] != null && actors[i].Active && !actors[i].IsManOrFutanari) { main = actors[i].Pointer == actor.Pointer; break; }
-            if (main) { var c = _scene._Counter_k__BackingField; if (c != null) c.IsWeakness = tired; }
-            Plugin.Debug($"Swap: tired (her/scene) {before} -> {SafeB(() => actor.IsWeakness)}/{SafeB(() => _scene.IsWeakness)}{(main ? " (main girl)" : "")}.");
+            {
+                var a = actors[i];
+                if (a == null || a.IsManOrFutanari || a.NPCData == null) continue;
+                var tired = a.Active && !threeP && _tired.Contains(ShownId(i, a));
+                if (SafeB(() => a.IsWeakness) != tired) a.hStatus?.SetWeakness(tired);
+                if (a.Active && main) { main = false; mainTired = tired; }
+                parts.Add($"{i}{(a.Active ? "" : " waiting")} {tired}");
+            }
+            var c = _scene._Counter_k__BackingField;
+            if (c != null) c.IsWeakness = mainTired;
+            Plugin.Debug($"Swap: tired girls (slot: tired) {string.Join(", ", parts)}; scene tired {before} -> {SafeB(() => _scene.IsWeakness)}.");
         }
         catch (Exception e) { Plugin.Log.LogWarning($"Swap: tiredness: {e.Message}"); }
+        return mainTired;
     }
 
     internal static bool WasTired(int id) => _tired.Contains(id);
@@ -537,8 +770,70 @@ internal static partial class Watchers
         try { ended = _scene.IsEnded; } catch { return; }
         if (!ended) return;
         Plugin.Debug("H is ending: the girls in the scene get their own bodies back.");
+        var tiredness = ReadEndTiredness();
         _ending = true;
         try { RestoreSlots(true); } finally { _ending = false; }
+        EndTired(tiredness);
+    }
+
+    // As H ends, what follows (the talk after it, how she walks off) goes by whether the scene's own girl got
+    // tired, not whoever was in her place at the end: (actor, her own girl's id) for every girl's slot.
+    // The scene empties its actor list as it ends, so this goes by the slots (each keeps its actor) and the main
+    // girl's slot as last seen while the scene ran.
+    private static List<(HActor actor, int id, bool main)> ReadEndTiredness()
+    {
+        var list = new List<(HActor, int, bool)>();
+        try
+        {
+            foreach (var slot in _slots.Values)
+            {
+                var a = slot.Actor;
+                if (a == null) continue;
+                var main = slot.Index == _mainIndex;
+                // The girl in the main slot now may have got tired since the last swap.
+                if (main && SafeB(() => a.IsWeakness)) _tired.Add(slot.ShownId);
+                list.Add((a, slot.OriginalId, main));
+            }
+        }
+        catch (Exception e) { Plugin.Log.LogWarning($"Reading tiredness at the end of H failed: {e.Message}"); }
+        return list;
+    }
+
+    private static int _mainIndex = -1;
+
+    // Which slot holds the main girl (the first girl in the scene), noted while the actor list can still be read.
+    private static void NoteMain()
+    {
+        try
+        {
+            var actors = _scene?.Actors;
+            for (var i = 0; actors != null && i < actors.Length; i++)
+                if (actors[i] != null && actors[i].Active && !actors[i].IsManOrFutanari) { _mainIndex = i; return; }
+        }
+        catch { }
+    }
+
+    private static void EndTired(List<(HActor actor, int id, bool main)> girls)
+    {
+        try
+        {
+            var parts = new List<string>();
+            foreach (var (a, id, main) in girls)
+            {
+                var tired = _tired.Contains(id);
+                try { if (SafeB(() => a.IsWeakness) != tired) a.hStatus?.SetWeakness(tired); } catch { }
+                if (main)
+                {
+                    var c = _scene._Counter_k__BackingField;
+                    if (c != null) c.IsWeakness = tired;
+                    var r = _scene.Result;
+                    if (r != null) r.IsWeakness = tired;
+                }
+                parts.Add($"{id}{(main ? " (main)" : "")} {tired}");
+            }
+            Plugin.Debug($"H ends; tired: {string.Join(", ", parts)}.");
+        }
+        catch (Exception e) { Plugin.Log.LogWarning($"Setting tiredness at the end of H failed: {e.Message}"); }
     }
 
     // Data first (for the girl the slot started with, her own data object), then the outfit she is wearing, then everything is

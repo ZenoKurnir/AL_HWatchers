@@ -13,7 +13,7 @@ namespace AL_HWatchers;
 public class Plugin : BasePlugin
 {
     public const string GUID = "AL_HWatchers";
-    public const string Version = "1.0.1";
+    public const string Version = "1.0.7";
 
     internal static new ManualLogSource Log;
     internal static ConfigEntry<bool> AutoBring;
@@ -69,6 +69,8 @@ public class Plugin : BasePlugin
         Harmony.CreateAndPatchAll(typeof(Hooks), GUID);
         try { Harmony.CreateAndPatchAll(typeof(MenuHooks), GUID + ".menu"); }
         catch (Exception e) { Log.LogWarning($"Clothes menu redraw not hooked: {e.Message}"); }
+        try { Harmony.CreateAndPatchAll(typeof(TiredHooks), GUID + ".tired"); }
+        catch (Exception e) { Log.LogWarning($"Keeping tired girls out of 3P not hooked: {e.Message}"); }
         try { Harmony.CreateAndPatchAll(typeof(SoloHooks), GUID + ".solo"); }
         catch (Exception e) { Log.LogWarning($"Solo H second girl not hooked: {e.Message}"); }
         WatcherMenu.Create();

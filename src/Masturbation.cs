@@ -1,6 +1,8 @@
 using System.Text;
 using Character;
 using UnityEngine;
+using NV = System.Numerics.Vector3;
+using NQ = System.Numerics.Quaternion;
 
 namespace AL_HWatchers;
 
@@ -14,8 +16,8 @@ internal sealed class TokClip
     public int Frames;
     public float Length;
     public string[] Bones;
-    public Quaternion[][] Rot;   // [bone][frame], null when the bone has no rotation samples
-    public Vector3[] HipsPos;    // [frame], Aicomi scale
+    public NQ[][] Rot;           // [bone][frame], null when the bone has no rotation samples
+    public NV[] HipsPos;         // [frame], Aicomi scale
 }
 
 internal static class TokLibrary
@@ -62,20 +64,20 @@ internal static class TokLibrary
                 var clip = new TokClip { Name = Str(r), Frames = r.ReadInt32(), Length = r.ReadSingle() };
                 var boneCount = r.ReadInt32();
                 clip.Bones = new string[boneCount];
-                clip.Rot = new Quaternion[boneCount][];
+                clip.Rot = new NQ[boneCount][];
                 for (var b = 0; b < boneCount; b++)
                 {
                     clip.Bones[b] = Str(r);
                     var flags = r.ReadByte();
                     if ((flags & 1) != 0)
                     {
-                        var rot = clip.Rot[b] = new Quaternion[clip.Frames];
-                        for (var f = 0; f < clip.Frames; f++) rot[f] = new Quaternion(r.ReadSingle(), r.ReadSingle(), r.ReadSingle(), r.ReadSingle());
+                        var rot = clip.Rot[b] = new NQ[clip.Frames];
+                        for (var f = 0; f < clip.Frames; f++) rot[f] = new NQ(r.ReadSingle(), r.ReadSingle(), r.ReadSingle(), r.ReadSingle());
                     }
                     if ((flags & 2) != 0)
                     {
-                        var pos = new Vector3[clip.Frames];
-                        for (var f = 0; f < clip.Frames; f++) pos[f] = new Vector3(r.ReadSingle(), r.ReadSingle(), r.ReadSingle());
+                        var pos = new NV[clip.Frames];
+                        for (var f = 0; f < clip.Frames; f++) pos[f] = new NV(r.ReadSingle(), r.ReadSingle(), r.ReadSingle());
                         if (clip.Bones[b] == "cf_j_hips") clip.HipsPos = pos;
                     }
                 }
@@ -97,6 +99,7 @@ internal static class TokLibrary
 
 // Plays TokClips on one girl's body skeleton. Her animator keeps running underneath (so nothing snaps to the
 // bind pose); the clip is written over its result in LateUpdate and blended in and out against it.
+// All the math runs in managed code (see Fast): only reading and writing her bones goes through the game.
 internal sealed class TokPlayer
 {
     private const float AicomiHipsHeight = 1.0785f;
@@ -118,11 +121,13 @@ internal sealed class TokPlayer
     private readonly float _scale;
     private readonly HumanHand _handShapes;
     private readonly bool[] _handShapesWere = new bool[2];
-    private readonly Dictionary<string, Quaternion> _last = new();
+    private readonly Dictionary<string, NQ> _last = new();
     private static readonly string[] FingerNames = { "thumb", "index", "middle", "ring", "little" };
     private readonly Transform[] _fingerShapes;
-    private Quaternion?[] _from;
-    private Vector3? _lastHips, _hipsFrom;
+    private NQ?[] _from;
+    private NV? _lastHips, _hipsFrom;
+    // Measuring a body is the costly part of starting: one girl per frame, so several starting together don't stall it.
+    private static int _measuredFrame = -1;
 
     public TokPlayer(Human h, string name, float worldScale)
     {
@@ -133,8 +138,9 @@ internal sealed class TokPlayer
         var fingerShapes = new List<Transform>();
         foreach (var t in (root ?? h.Transform).GetComponentsInChildren<Transform>(true))
         {
-            if (t.name.StartsWith("cf_j_") && !_bones.ContainsKey(t.name)) _bones[t.name] = t;
-            else if (t.name.StartsWith("cf_s_") && FingerNames.Any(f => t.name.Contains(f))) fingerShapes.Add(t);
+            var n = t.name;
+            if (n.StartsWith("cf_j_") && !_bones.ContainsKey(n)) _bones[n] = t;
+            else if (n.StartsWith("cf_s_") && FingerNames.Any(f => n.Contains(f))) fingerShapes.Add(t);
         }
         _fingerShapes = fingerShapes.ToArray();
         _bones.TryGetValue("cf_j_hips", out _hips);
@@ -142,7 +148,7 @@ internal sealed class TokPlayer
         Plugin.Debug($"{name}: masturbation skeleton {(root != null ? Path(root) : "not found, using whole character")}, {_bones.Count} bones, hips {(_hips != null ? "found" : "missing")}.");
         _hands = new[] { Hand.Find(_bones, "L"), Hand.Find(_bones, "R") }.Where(x => x != null).ToArray();
         _human = h;
-        Measure();
+        _measureAt = 0f; // on her first frame
         // The game's hand shapes would bend her fingers again on top of the clip.
         try
         {
@@ -196,7 +202,7 @@ internal sealed class TokPlayer
         _blend = 0f;
         _blendTime = blendTime;
         _targets = new Transform[clip.Bones.Length];
-        _from = new Quaternion?[clip.Bones.Length];
+        _from = new NQ?[clip.Bones.Length];
         _hipsFrom = _lastHips;
         var mapped = 0;
         for (var b = 0; b < clip.Bones.Length; b++)
@@ -212,8 +218,10 @@ internal sealed class TokPlayer
 
     private void Measure()
     {
+        var t0 = Time.realtimeSinceStartup;
         try { _surface = BodySurface.Build(_human, _bones, _name, _scale); }
         catch (Exception e) { _surface = null; Plugin.Log.LogWarning($"{_name}: could not measure her body, hands may pass through it: {e.Message}"); }
+        Plugin.Debug($"{_name}: body measured in {(Time.realtimeSinceStartup - t0) * 1000f:0} ms.");
     }
 
     // Her clothes changed: measure again once the new pieces are showing.
@@ -226,45 +234,52 @@ internal sealed class TokPlayer
     {
         if (_clip == null) return;
         _time += dt;
-        if (_blend < 1f) _blend = _blendTime > 0f ? Mathf.Min(1f, _blend + dt / _blendTime) : 1f;
-        if (_fadeTime > 0f) _fade = Mathf.Max(0f, _fade - dt / _fadeTime);
-        var bw = Mathf.SmoothStep(0f, 1f, _blend);
-        var w = Mathf.SmoothStep(0f, 1f, _fade);
+        if (_blend < 1f) _blend = _blendTime > 0f ? Math.Min(1f, _blend + dt / _blendTime) : 1f;
+        if (_fadeTime > 0f) _fade = Math.Max(0f, _fade - dt / _fadeTime);
+        var bw = Fast.SmoothStep(0f, 1f, _blend);
+        var w = Fast.SmoothStep(0f, 1f, _fade);
         if (w <= 0f) return;
-        var t = Loop ? Mathf.Repeat(_time, _clip.Length) : Mathf.Min(_time, _clip.Length);
-        var pos = _clip.Length > 0f ? t / _clip.Length * (_clip.Frames - 1) : 0f;
-        var f0 = Mathf.Clamp((int)pos, 0, _clip.Frames - 1);
-        var f1 = Mathf.Min(f0 + 1, _clip.Frames - 1);
-        var a = pos - f0;
+        var len = _clip.Length;
+        var t = Loop ? (len > 0f ? _time - MathF.Floor(_time / len) * len : 0f) : Math.Min(_time, len);
+        var pos = len > 0f ? t / len * (_clip.Frames - 1) : 0f;
+        var f0 = Math.Clamp((int)pos, 0, _clip.Frames - 1);
+        var f1 = Math.Min(f0 + 1, _clip.Frames - 1);
+        var a = Fast.Clamp01(pos - f0);
         for (var b = 0; b < _targets.Length; b++)
         {
             var target = _targets[b];
             if (target == null) continue;
             var rot = _clip.Rot[b];
-            var q = Quaternion.Slerp(rot[f0], rot[f1], a);
-            if (bw < 1f) q = Quaternion.Slerp(_from[b] ?? target.localRotation, q, bw);
+            var q = NQ.Slerp(rot[f0], rot[f1], a);
+            // Her current rotation is read from the game only while blending in or letting go.
+            if (bw < 1f) q = NQ.Slerp(_from[b] ?? Fast.N(target.localRotation), q, bw);
             _last[_clip.Bones[b]] = q;
-            target.localRotation = w < 1f ? Quaternion.Slerp(target.localRotation, q, w) : q;
+            target.localRotation = Fast.U(w < 1f ? NQ.Slerp(Fast.N(target.localRotation), q, w) : q);
         }
         if (_hips != null && _clip.HipsPos != null)
         {
             // Aicomi's hips sit straight under the height node; Amanatsu adds cf_j_hips_length (10x larger) in between.
-            var lengthOffset = _hipsLength != null ? _hipsLength.localPosition : Vector3.zero;
-            var k = lengthOffset.y > 0.01f ? lengthOffset.y / AicomiHipsHeight : 10f;
-            var p = Vector3.Lerp(_clip.HipsPos[f0], _clip.HipsPos[f1], a) * k - lengthOffset;
-            if (bw < 1f) p = Vector3.Lerp(_hipsFrom ?? _hips.localPosition, p, bw);
+            var lengthOffset = _hipsLength != null ? Fast.N(_hipsLength.localPosition) : NV.Zero;
+            var k = lengthOffset.Y > 0.01f ? lengthOffset.Y / AicomiHipsHeight : 10f;
+            var p = NV.Lerp(_clip.HipsPos[f0], _clip.HipsPos[f1], a) * k - lengthOffset;
+            if (bw < 1f) p = NV.Lerp(_hipsFrom ?? Fast.N(_hips.localPosition), p, bw);
             _lastHips = p;
-            _hips.localPosition = w < 1f ? Vector3.Lerp(_hips.localPosition, p, w) : p;
+            _hips.localPosition = Fast.U(w < 1f ? NV.Lerp(Fast.N(_hips.localPosition), p, w) : p);
         }
         // The game poses fingers through these shape bones too; whatever bend they hold would add to the clip's.
         foreach (var f in _fingerShapes)
-            if (f != null) f.localRotation = w < 1f ? Quaternion.Slerp(f.localRotation, Quaternion.identity, w) : Quaternion.identity;
-        if (_measureAt > 0f && Time.realtimeSinceStartup >= _measureAt) { _measureAt = -1f; Measure(); }
+            if (f != null) f.localRotation = w < 1f ? Fast.U(NQ.Slerp(Fast.N(f.localRotation), NQ.Identity, w)) : Fast.Identity;
+        if (_measureAt >= 0f && Time.frameCount != _measuredFrame && Time.realtimeSinceStartup >= _measureAt)
+        {
+            _measuredFrame = Time.frameCount;
+            _measureAt = -1f;
+            Measure();
+        }
         if (_surface != null)
         {
             _surface.Update();
             foreach (var hand in _hands) hand.KeepOut(_surface, _scale, w, dt);
-            if (Time.realtimeSinceStartup >= _reportAt)
+            if (Plugin.DebugLog.Value && Time.realtimeSinceStartup >= _reportAt)
             {
                 _reportAt = Time.realtimeSinceStartup + 6f;
                 Plugin.Debug($"{_name} ({State}): overlap in cm: {string.Join("; ", _hands.Select(x => x.Report()))}.");
@@ -293,9 +308,11 @@ internal sealed class TokPlayer
 internal sealed class BodySurface
 {
     private Transform[] _bones;
+    private Affine[] _matrices;
     private int[] _bone;
-    private Vector3[] _local, _localN;
-    private Vector3[] _world, _worldN;
+    private NV[] _local, _localN;
+    private NV[] _world, _worldN;
+    private NV _min, _max;      // the box around the crotch points this frame, to skip the search when far away
     private BreastShape[] _breasts = Array.Empty<BreastShape>();
 
     private static readonly string[] Anchors =
@@ -313,27 +330,40 @@ internal sealed class BodySurface
             if (skeleton.TryGetValue(n, out var t)) { anchors.Add(t); anchorNames.Add(n); }
         skeleton.TryGetValue("cf_j_kokan", out var kokan);
         if (anchors.Count < 4) throw new InvalidOperationException("skeleton bones missing");
-        var anchorPos = anchors.Select(b => b.position).ToArray();
-        var crotch = kokan != null ? kokan.position : Vector3.zero;
+        var anchorPos = anchors.Select(b => Fast.N(b.position)).ToArray();
+        var crotch = kokan != null ? Fast.N(kokan.position) : NV.Zero;
         var crotchReach = 0.16f * k;
 
         var boneList = new List<Transform>(); var boneIndex = new Dictionary<IntPtr, int>();
-        var bone = new List<int>(); var local = new List<Vector3>(); var localN = new List<Vector3>();
+        // Each bone's world-to-local transform, read once.
+        var inverse = new Dictionary<IntPtr, (Affine point, NQ dir)>();
+        (Affine point, NQ dir) InverseOf(Transform t)
+        {
+            if (!inverse.TryGetValue(t.Pointer, out var inv)) inverse[t.Pointer] = inv = (new Affine(t.worldToLocalMatrix), Fast.InverseRotation(t));
+            return inv;
+        }
+        var bone = new List<int>(); var local = new List<NV>(); var localN = new List<NV>();
         var report = new List<string>();
-        var breastPoints = new[] { new List<Vector3>(), new List<Vector3>() };
+        var breastPoints = new[] { new List<NV>(), new List<NV>() };
         skeleton.TryGetValue("cf_j_bust02_L", out var bustL);
         skeleton.TryGetValue("cf_j_bust02_R", out var bustR);
+        var bustLPos = bustL != null ? Fast.N(bustL.position) : NV.Zero;
+        var bustRPos = bustR != null ? Fast.N(bustR.position) : NV.Zero;
         foreach (var (body, skinPiece) in meshes)
         {
             var baked = new Mesh();
             body.BakeMesh(baked);
-            var verts = baked.vertices;
-            var norms = baked.normals;
+            var bakedVerts = baked.vertices;
+            var bakedNorms = baked.normals;
             UnityEngine.Object.Destroy(baked);
+            var verts = new NV[bakedVerts.Length];
+            for (var v = 0; v < verts.Length; v++) verts[v] = Fast.N(bakedVerts[v]);
+            var norms = new NV[bakedNorms?.Length ?? 0];
+            for (var v = 0; v < norms.Length; v++) norms[v] = Fast.N(bakedNorms[v]);
             var toWorld = BakedSpace(body, verts, skeleton, k, name, out var rotate);
 
             // Skin weights tie each point to the bone that really moves it; without them, the nearest skeleton bone.
-            Transform[] skin = null; int[] dominant = null;
+            Transform[] skin = null; string[] skinNames = null; int[] dominant = null;
             try
             {
                 var mesh = body.sharedMesh;
@@ -343,55 +373,58 @@ internal sealed class BodySurface
                     if (weights != null && weights.Length == verts.Length)
                     {
                         skin = body.bones.ToArray();
+                        skinNames = skin.Select(t => t != null ? t.name : null).ToArray();
                         dominant = new int[weights.Length];
                         for (var v = 0; v < weights.Length; v++)
                         {
                             var w = weights[v];
-                            int bi = w.boneIndex0; var bw = w.weight0;
-                            if (w.weight1 > bw) { bi = w.boneIndex1; bw = w.weight1; }
-                            if (w.weight2 > bw) { bi = w.boneIndex2; bw = w.weight2; }
-                            if (w.weight3 > bw) { bi = w.boneIndex3; }
+                            int bi = w.m_BoneIndex0; var bw = w.m_Weight0;
+                            if (w.m_Weight1 > bw) { bi = w.m_BoneIndex1; bw = w.m_Weight1; }
+                            if (w.m_Weight2 > bw) { bi = w.m_BoneIndex2; bw = w.m_Weight2; }
+                            if (w.m_Weight3 > bw) { bi = w.m_BoneIndex3; }
                             dominant[v] = bi;
                         }
                     }
                 }
             }
-            catch { skin = null; dominant = null; }
+            catch { skin = null; skinNames = null; dominant = null; }
 
             int breastCount = 0, crotchCount = 0;
             for (var v = 0; v < verts.Length; v++)
             {
                 var p = toWorld(verts[v]);
                 var best = float.MaxValue; var ai = 0;
-                for (var i = 0; i < anchorPos.Length; i++) { var d = (anchorPos[i] - p).sqrMagnitude; if (d < best) { best = d; ai = i; } }
+                for (var i = 0; i < anchorPos.Length; i++) { var d = NV.DistanceSquared(anchorPos[i], p); if (d < best) { best = d; ai = i; } }
                 Transform attach = anchors[ai];
+                string attachName = anchorNames[ai];
                 bool breast;
                 if (dominant != null && dominant[v] < skin.Length && skin[dominant[v]] != null)
                 {
                     attach = skin[dominant[v]];
-                    var bn = attach.name;
-                    breast = (bn.Contains("bust") || bn.Contains("bnip")) && !bn.Contains("bust00");
+                    attachName = skinNames[dominant[v]];
+                    breast = (attachName.Contains("bust") || attachName.Contains("bnip")) && !attachName.Contains("bust00");
                 }
-                else breast = anchorNames[ai].StartsWith("cf_j_bust02") || anchorNames[ai].StartsWith("cf_j_bust03");
+                else breast = attachName.StartsWith("cf_j_bust02") || attachName.StartsWith("cf_j_bust03");
                 // Clothes only count over the breasts: around the crotch a skirt would push her hand out from under it.
-                var nearCrotch = skinPiece && kokan != null && (p - crotch).magnitude < crotchReach;
+                var nearCrotch = skinPiece && kokan != null && (p - crotch).Length() < crotchReach;
                 if (!breast && !nearCrotch) continue;
-                var n = norms != null && v < norms.Length ? rotate(norms[v]) : Vector3.zero;
-                if (n.sqrMagnitude < 1e-8f) continue;
+                var n = v < norms.Length ? rotate(norms[v]) : NV.Zero;
+                if (n.LengthSquared() < 1e-8f) continue;
                 if (breast)
                 {
                     // Breasts get their own shape (below); the point-by-point surface is for the crotch.
                     breastCount++;
-                    var right = attach.name.EndsWith("_R") || (!attach.name.EndsWith("_L") && bustL != null && bustR != null
-                        && (p - bustR.position).sqrMagnitude < (p - bustL.position).sqrMagnitude);
+                    var right = attachName.EndsWith("_R") || (!attachName.EndsWith("_L") && bustL != null && bustR != null
+                        && NV.DistanceSquared(p, bustRPos) < NV.DistanceSquared(p, bustLPos));
                     breastPoints[right ? 1 : 0].Add(p);
                     continue;
                 }
                 crotchCount++;
                 if (!boneIndex.TryGetValue(attach.Pointer, out var idx)) { idx = boneList.Count; boneList.Add(attach); boneIndex[attach.Pointer] = idx; }
+                var inv = InverseOf(attach);
                 bone.Add(idx);
-                local.Add(attach.InverseTransformPoint(p));
-                localN.Add(attach.InverseTransformDirection(n.normalized));
+                local.Add(inv.point.Point(p));
+                localN.Add(NV.Transform(NV.Normalize(n), inv.dir));
             }
             report.Add($"{body.name} ({verts.Length} vertices, {(dominant != null ? "weights" : "nearest bones")}): {breastCount} breast, {crotchCount} crotch");
         }
@@ -402,32 +435,34 @@ internal sealed class BodySurface
         if (bone.Count == 0 && breasts.Count == 0) return null;
         return new BodySurface
         {
-            _bones = boneList.ToArray(), _bone = bone.ToArray(), _local = local.ToArray(), _localN = localN.ToArray(),
-            _world = new Vector3[bone.Count], _worldN = new Vector3[bone.Count], _breasts = breasts.ToArray()
+            _bones = boneList.ToArray(), _matrices = new Affine[boneList.Count], _bone = bone.ToArray(), _local = local.ToArray(), _localN = localN.ToArray(),
+            _world = new NV[bone.Count], _worldN = new NV[bone.Count], _breasts = breasts.ToArray()
         };
     }
 
     // Which way a breast points: from its root on the chest to the nipple.
-    private static Vector3 Forward(Dictionary<string, Transform> skeleton, string side) =>
+    private static NV Forward(Dictionary<string, Transform> skeleton, string side) =>
         skeleton.TryGetValue("cf_j_bust01_" + side, out var a) && skeleton.TryGetValue("cf_j_bust03_" + side, out var b)
-            ? b.position - a.position : Vector3.zero;
+            ? Fast.N(b.position) - Fast.N(a.position) : NV.Zero;
 
     // Which space BakeMesh left the points in: whichever reading puts her surface closest to her own bones.
-    private static Func<Vector3, Vector3> BakedSpace(SkinnedMeshRenderer smr, Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Vector3> verts,
-        Dictionary<string, Transform> skeleton, float k, string name, out Func<Vector3, Vector3> rotate)
+    private static Func<NV, NV> BakedSpace(SkinnedMeshRenderer smr, NV[] verts, Dictionary<string, Transform> skeleton, float k, string name, out Func<NV, NV> rotate)
     {
         var tr = smr.transform;
-        var pos = tr.position; var rot = tr.rotation; var m = tr.localToWorldMatrix;
-        var root = smr.rootBone; var rm = root != null ? root.localToWorldMatrix : m; var rr = root != null ? root.rotation : rot;
-        var options = new (string name, Func<Vector3, Vector3> map, Func<Vector3, Vector3> rot)[]
+        var pos = Fast.N(tr.position); var rot = Fast.N(tr.rotation); var m = new Affine(tr.localToWorldMatrix);
+        var root = smr.rootBone;
+        var rm = root != null ? new Affine(root.localToWorldMatrix) : m;
+        var rr = root != null ? Fast.N(root.rotation) : rot;
+        var rootPos = root != null ? Fast.N(root.position) : pos;
+        var options = new (string name, Func<NV, NV> map, Func<NV, NV> rot)[]
         {
-            ("renderer, unscaled", v => pos + rot * v, v => rot * v),
-            ("renderer", v => m.MultiplyPoint3x4(v), v => m.MultiplyVector(v)),
-            ("root bone", v => rm.MultiplyPoint3x4(v), v => rm.MultiplyVector(v)),
-            ("root bone, unscaled", v => (root != null ? root.position : pos) + rr * v, v => rr * v),
+            ("renderer, unscaled", v => pos + NV.Transform(v, rot), v => NV.Transform(v, rot)),
+            ("renderer", v => m.Point(v), v => m.Vector(v)),
+            ("root bone", v => rm.Point(v), v => rm.Vector(v)),
+            ("root bone, unscaled", v => rootPos + NV.Transform(v, rr), v => NV.Transform(v, rr)),
             ("world", v => v, v => v),
         };
-        var bones = skeleton.Values.Where(b => b != null).Select(b => b.position).ToArray();
+        var bones = skeleton.Values.Where(b => b != null).Select(b => Fast.N(b.position)).ToArray();
         var step = Math.Max(1, verts.Length / 300);
         var bestScore = float.MaxValue; var best = 0;
         var report = new List<string>();
@@ -438,7 +473,7 @@ internal sealed class BodySurface
             {
                 var p = options[o].map(verts[v]);
                 var d = float.MaxValue;
-                foreach (var b in bones) d = Mathf.Min(d, (b - p).sqrMagnitude);
+                foreach (var b in bones) d = Math.Min(d, NV.DistanceSquared(b, p));
                 sum += Math.Sqrt(d); count++;
             }
             var score = (float)(sum / Math.Max(1, count));
@@ -477,47 +512,53 @@ internal sealed class BodySurface
     public void Update()
     {
         foreach (var b in _breasts) b.Update();
-        var m = new Matrix4x4[_bones.Length];
-        for (var i = 0; i < _bones.Length; i++) m[i] = _bones[i].localToWorldMatrix;
+        for (var i = 0; i < _bones.Length; i++) _matrices[i] = new Affine(_bones[i].localToWorldMatrix);
+        var min = new NV(float.MaxValue); var max = new NV(float.MinValue);
         for (var i = 0; i < _bone.Length; i++)
         {
-            var mm = m[_bone[i]];
-            _world[i] = mm.MultiplyPoint3x4(_local[i]);
-            _worldN[i] = mm.MultiplyVector(_localN[i]).normalized;
+            var mm = _matrices[_bone[i]];
+            var p = _world[i] = mm.Point(_local[i]);
+            _worldN[i] = NV.Normalize(mm.Vector(_localN[i]));
+            min = NV.Min(min, p); max = NV.Max(max, p);
         }
+        _min = min; _max = max;
     }
 
     // How far a point (with some thickness of its own) is inside her, and which way is out.
-    public bool Depth(Vector3 p, float margin, float reach, out Vector3 push, bool sideways = false)
+    public bool Depth(NV p, float margin, float reach, out NV push, bool sideways = false)
     {
-        var inSurface = SurfaceDepth(p, margin, reach, out push);
+        // Upper arms only meet her breasts: the crotch search would catch a crouching girl's thighs and wrench her elbow.
+        push = NV.Zero;
+        var inSurface = !sideways && SurfaceDepth(p, margin, reach, out push);
         foreach (var b in _breasts)
-            if (b.Depth(p, margin, sideways, out var bp) && bp.sqrMagnitude > push.sqrMagnitude) { push = bp; inSurface = true; }
+            if (b.Depth(p, margin, sideways, out var bp) && bp.LengthSquared() > push.LengthSquared()) { push = bp; inSurface = true; }
         return inSurface;
     }
 
-    private bool SurfaceDepth(Vector3 p, float margin, float reach, out Vector3 push)
+    private bool SurfaceDepth(NV p, float margin, float reach, out NV push)
     {
-        push = Vector3.zero;
+        push = NV.Zero;
+        if (_world.Length == 0) return false;
+        // Nowhere near the crotch: nothing to search.
+        if (p.X < _min.X - reach || p.Y < _min.Y - reach || p.Z < _min.Z - reach ||
+            p.X > _max.X + reach || p.Y > _max.Y + reach || p.Z > _max.Z + reach) return false;
         var r2 = reach * reach;
         int n0 = -1, n1 = -1, n2 = -1; float d0 = r2, d1 = r2, d2 = r2;
         for (var i = 0; i < _world.Length; i++)
         {
-            var d = (_world[i] - p).sqrMagnitude;
+            var d = NV.DistanceSquared(_world[i], p);
             if (d >= d2) continue;
             if (d < d0) { n2 = n1; d2 = d1; n1 = n0; d1 = d0; n0 = i; d0 = d; }
             else if (d < d1) { n2 = n1; d2 = d1; n1 = i; d1 = d; }
             else { n2 = i; d2 = d; }
         }
         if (n0 < 0) return false;
-        Vector3 sp = Vector3.zero, sn = Vector3.zero; var c = 0;
-        foreach (var i in new[] { n0, n1, n2 })
-        {
-            if (i < 0) continue;
-            sp += _world[i]; sn += _worldN[i]; c++;
-        }
-        sp /= c; sn = sn.normalized;
-        var depth = margin - Vector3.Dot(p - sp, sn);
+        NV sp = NV.Zero, sn = NV.Zero; var c = 0;
+        if (n0 >= 0) { sp += _world[n0]; sn += _worldN[n0]; c++; }
+        if (n1 >= 0) { sp += _world[n1]; sn += _worldN[n1]; c++; }
+        if (n2 >= 0) { sp += _world[n2]; sn += _worldN[n2]; c++; }
+        sp /= c; sn = Fast.Normalized(sn);
+        var depth = margin - NV.Dot(p - sp, sn);
         if (depth <= 0f) return false;
         push = sn * depth;
         return true;
@@ -530,25 +571,26 @@ internal sealed class BreastShape
 {
     private const int Rows = 24, Cols = 48;
     private Transform _bone;
-    private Vector3 _center;
+    private NV _center;
     private float[] _reach;
-    private Matrix4x4 _toLocal, _toWorld;
+    private Affine _toLocal, _toWorld;
     private float _scale;
     private int _count;
-    private Vector3 _axis;      // bone space, towards the nipple
+    private NV _axis;           // bone space, towards the nipple
     private float _maxReach;
 
-    public static BreastShape Build(Transform bone, List<Vector3> world, Vector3 forward)
+    public static BreastShape Build(Transform bone, List<NV> world, NV forward)
     {
-        if (bone == null || world.Count < 30 || forward.sqrMagnitude < 1e-10f) return null;
-        var pts = world.Select(bone.InverseTransformPoint).ToList();
-        var c = Vector3.zero;
+        if (bone == null || world.Count < 30 || forward.LengthSquared() < 1e-10f) return null;
+        var toLocal = new Affine(bone.worldToLocalMatrix);
+        var pts = world.Select(toLocal.Point).ToList();
+        var c = NV.Zero;
         foreach (var q in pts) c += q;
         c /= pts.Count;
         var reach = new float[Rows * Cols];
         foreach (var q in pts)
         {
-            var d = q - c; var r = d.magnitude;
+            var d = q - c; var r = d.Length();
             if (r < 1e-6f) continue;
             var i = Bin(d / r);
             if (r > reach[i]) reach[i] = r;
@@ -575,14 +617,14 @@ internal sealed class BreastShape
         return new BreastShape
         {
             _bone = bone, _center = c, _reach = reach, _count = pts.Count, _maxReach = reach.Max(),
-            _axis = bone.InverseTransformDirection(forward).normalized
+            _axis = Fast.Normalized(NV.Transform(forward, Fast.InverseRotation(bone)))
         };
     }
 
-    private static int Bin(Vector3 u)
+    private static int Bin(NV u)
     {
-        var row = Mathf.Clamp((int)(Mathf.Acos(Mathf.Clamp(u.y, -1f, 1f)) / Mathf.PI * Rows), 0, Rows - 1);
-        var col = Mathf.Clamp((int)((Mathf.Atan2(u.z, u.x) + Mathf.PI) / (2f * Mathf.PI) * Cols), 0, Cols - 1);
+        var row = Math.Clamp((int)(MathF.Acos(Fast.Clamp(u.Y, -1f, 1f)) / MathF.PI * Rows), 0, Rows - 1);
+        var col = Math.Clamp((int)((MathF.Atan2(u.Z, u.X) + MathF.PI) / (2f * MathF.PI) * Cols), 0, Cols - 1);
         return row * Cols + col;
     }
 
@@ -590,15 +632,15 @@ internal sealed class BreastShape
 
     public void Update()
     {
-        _toLocal = _bone.worldToLocalMatrix;
-        _toWorld = _bone.localToWorldMatrix;
-        _scale = Mathf.Max(1e-6f, _bone.lossyScale.x);
+        _toLocal = new Affine(_bone.worldToLocalMatrix);
+        _toWorld = new Affine(_bone.localToWorldMatrix);
+        _scale = Math.Max(1e-6f, _bone.lossyScale.x);
     }
 
-    private bool Inside(Vector3 local, float margin)
+    private bool Inside(NV local, float margin)
     {
         var d = local - _center;
-        var r = d.magnitude;
+        var r = d.Length();
         if (r < 1e-6f) return true;
         var reach = _reach[Bin(d / r)];
         return reach > 0f && r < reach + margin;
@@ -606,23 +648,25 @@ internal sealed class BreastShape
 
     // How far a point inside has to move to get out. Hands and forearms come out the front, the way the breast
     // points (going round her side would send them towards her armpit); upper arms come out to the side.
-    public bool Depth(Vector3 p, float margin, bool sideways, out Vector3 push)
+    public bool Depth(NV p, float margin, bool sideways, out NV push)
     {
-        push = Vector3.zero;
-        var q = _toLocal.MultiplyPoint3x4(p);
+        push = NV.Zero;
+        var q = _toLocal.Point(p);
         var m = margin / _scale;
+        // Further from the middle than the breast reaches at all: outside.
+        if ((q - _center).Length() >= _maxReach + m) return false;
         if (!Inside(q, m)) return false;
         var dir = _axis;
         if (sideways)
         {
-            var side = q - _center - Vector3.Project(q - _center, _axis);
-            if (side.sqrMagnitude > 1e-8f) dir = side.normalized;
+            var side = q - _center - Fast.Project(q - _center, _axis);
+            if (side.LengthSquared() > 1e-8f) dir = NV.Normalize(side);
         }
         var step = _maxReach / 24f;
         var t = step;
         for (; t < _maxReach * 2.5f; t += step)
             if (!Inside(q + dir * t, m)) break;
-        push = _toWorld.MultiplyVector(dir * t);
+        push = _toWorld.Vector(dir * t);
         return true;
     }
 }
@@ -635,9 +679,10 @@ internal sealed class Hand
 {
     private Transform _upper, _lower, _hand, _palm;
     private Transform[] _tips;
-    private Vector3 _handPush, _elbowPush;
+    private NV _handPush, _elbowPush;
     private string _side;
     private float _seenHand, _seenForearm, _seenUpper, _seenApplied, _seenLeft;
+    private (NV p, float margin)[] _handPts, _forearmPts, _upperPts;
 
     public static Hand Find(Dictionary<string, Transform> bones, string side)
     {
@@ -647,81 +692,94 @@ internal sealed class Hand
         foreach (var f in new[] { "index03", "middle03", "ring03" })
             if (bones.TryGetValue($"cf_j_{f}_{side}", out var t)) tips.Add(t);
         bones.TryGetValue("cf_j_middle01_" + side, out var palm);
-        return new Hand { _upper = u, _lower = l, _hand = h, _tips = tips.ToArray(), _palm = palm, _side = side };
+        return new Hand
+        {
+            _upper = u, _lower = l, _hand = h, _tips = tips.ToArray(), _palm = palm, _side = side,
+            _handPts = new (NV, float)[tips.Count + (palm != null ? 1 : 0)],
+            _forearmPts = new (NV, float)[ForearmAt.Length], _upperPts = new (NV, float)[UpperArmAt.Length]
+        };
     }
 
     // Smooth rather than exact: the correction follows slowly (about a third of a second) so the arm glides
     // instead of shaking from frame to frame, and leaves about a centimeter of overlap, however big she is.
-    private const float Follow = 2f, RiseRate = 6f, Allowed = 0.004f;
+    private const float Follow = 2f, RiseRate = 6f, Allowed = 0.004f, MaxElbowPush = 0.06f;
+    // How far the wrist may bend to keep the hand as the clip had it while the forearm swings; past this the hand turns with the forearm.
+    private const float KeepWristUpTo = 20f, FollowForearmFrom = 50f;
     private static readonly float[] ForearmAt = { 0.2f, 0.45f, 0.7f, 0.9f };
     private static readonly float[] UpperArmAt = { 0.5f, 0.75f, 1f };
 
     public void KeepOut(BodySurface body, float k, float weight, float dt)
     {
         var reach = 0.16f * k; // deep enough to find the way out of big breasts
-        Vector3 shoulder = _upper.position, elbow = _lower.position, wrist = _hand.position;
+        NV shoulder = Fast.N(_upper.position), elbow = Fast.N(_lower.position), wrist = Fast.N(_hand.position);
 
         // The hand moves as one piece: find how far it has to go for the palm and the fingertips to all be out.
         // Fingertips may press in about a centimeter, as fingers squeezing would.
-        var handPts = new List<(Vector3 p, float margin)>();
-        if (_palm != null) handPts.Add((Vector3.Lerp(wrist, _palm.position, 0.6f), 0.012f * k));
-        foreach (var t in _tips) handPts.Add((t.position, -0.01f * k));
+        var h = 0;
+        if (_palm != null) _handPts[h++] = (NV.Lerp(wrist, Fast.N(_palm.position), 0.6f), 0.012f * k);
+        foreach (var t in _tips) _handPts[h++] = (Fast.N(t.position), -0.01f * k);
         // Arm thickness around the bone: 3.5 cm at the elbow down to 2.5 cm at the wrist, 4 cm for the upper arm.
-        var forearmPts = ForearmAt.Select(t => (Vector3.Lerp(elbow, wrist, t), Mathf.Lerp(0.035f, 0.025f, t) * k)).ToList();
-        var upperPts = UpperArmAt.Select(t => (Vector3.Lerp(shoulder, elbow, t), 0.04f * k)).ToList();
+        for (var i = 0; i < ForearmAt.Length; i++)
+            _forearmPts[i] = (NV.Lerp(elbow, wrist, ForearmAt[i]), (0.035f + (0.025f - 0.035f) * ForearmAt[i]) * k);
+        for (var i = 0; i < UpperArmAt.Length; i++)
+            _upperPts[i] = (NV.Lerp(shoulder, elbow, UpperArmAt[i]), 0.04f * k);
 
-        var hand = Solve(body, handPts, reach, out var handDepth);
-        var forearm = Solve(body, forearmPts, reach, out var forearmDepth);
-        var upperArm = Solve(body, upperPts, reach, out var upperDepth, true);
-        _seenHand = Mathf.Max(_seenHand, handDepth / k);
-        _seenForearm = Mathf.Max(_seenForearm, forearmDepth / k);
-        _seenUpper = Mathf.Max(_seenUpper, upperDepth / k);
+        var hand = Solve(body, _handPts, reach, out var handDepth);
+        var forearm = Solve(body, _forearmPts, reach, out var forearmDepth);
+        var upperArm = Solve(body, _upperPts, reach, out var upperDepth, true);
+        _seenHand = Math.Max(_seenHand, handDepth / k);
+        _seenForearm = Math.Max(_seenForearm, forearmDepth / k);
+        _seenUpper = Math.Max(_seenUpper, upperDepth / k);
         hand = Trim(hand, k); forearm = Trim(forearm, k); upperArm = Trim(upperArm, k);
         // A forearm inside her moves the whole forearm: the hand takes whatever part of it its own push lacks.
-        if (forearm != Vector3.zero)
+        if (forearm != NV.Zero)
         {
-            var dir = forearm.normalized;
-            hand += dir * Mathf.Max(0f, forearm.magnitude - Vector3.Dot(hand, dir));
+            var dir = NV.Normalize(forearm);
+            hand += dir * Math.Max(0f, forearm.Length() - NV.Dot(hand, dir));
         }
         var elbowPush = forearm + upperArm;
+        // An elbow moved much further than this bends the arm out of shape: a little overlap left looks better.
+        var elbowLen = elbowPush.Length();
+        if (elbowLen > MaxElbowPush * k) elbowPush *= MaxElbowPush * k / elbowLen;
 
         // Moves out briskly and settles back slowly, so it neither lags inside her nor shakes.
         _handPush = Ease(_handPush, hand, dt);
         _elbowPush = Ease(_elbowPush, elbowPush, dt);
-        _seenApplied = Mathf.Max(_seenApplied, _handPush.magnitude * weight / k);
-        if (_handPush.sqrMagnitude < 1e-8f && _elbowPush.sqrMagnitude < 1e-8f) return;
+        _seenApplied = Math.Max(_seenApplied, _handPush.Length() * weight / k);
+        if (_handPush.LengthSquared() < 1e-8f && _elbowPush.LengthSquared() < 1e-8f) return;
         Reach(wrist + _handPush * weight, elbow + _elbowPush * weight);
 
         // What is still inside after the move, for the log.
+        if (!Plugin.DebugLog.Value) return;
         var left = 0f;
-        var moved = _hand.position - wrist;
-        foreach (var (p, m) in handPts)
-            if (body.Depth(p + moved, m, reach, out var push)) left = Mathf.Max(left, push.magnitude);
-        _seenLeft = Mathf.Max(_seenLeft, left / k);
+        var moved = Fast.N(_hand.position) - wrist;
+        foreach (var (p, m) in _handPts)
+            if (body.Depth(p + moved, m, reach, out var push)) left = Math.Max(left, push.Length());
+        _seenLeft = Math.Max(_seenLeft, left / k);
     }
 
     // How far a rigid piece has to move for all its points to be out: a few steps, each pushing out the point
     // that is deepest from where the previous steps left it.
-    private static Vector3 Solve(BodySurface body, List<(Vector3 p, float margin)> pts, float reach, out float firstDepth, bool sideways = false)
+    private static NV Solve(BodySurface body, (NV p, float margin)[] pts, float reach, out float firstDepth, bool sideways = false)
     {
-        var total = Vector3.zero;
+        var total = NV.Zero;
         firstDepth = 0f;
         for (var step = 0; step < 4; step++)
         {
-            var best = Vector3.zero;
+            var best = NV.Zero;
             foreach (var (p, m) in pts)
-                if (body.Depth(p + total, m, reach, out var push, sideways) && push.sqrMagnitude > best.sqrMagnitude) best = push;
-            if (step == 0) firstDepth = best.magnitude;
-            if (best.sqrMagnitude < 1e-10f) break;
+                if (body.Depth(p + total, m, reach, out var push, sideways) && push.LengthSquared() > best.LengthSquared()) best = push;
+            if (step == 0) firstDepth = best.Length();
+            if (best.LengthSquared() < 1e-10f) break;
             total += best;
         }
         return total;
     }
 
-    private static Vector3 Ease(Vector3 current, Vector3 target, float dt)
+    private static NV Ease(NV current, NV target, float dt)
     {
-        var rate = target.sqrMagnitude > current.sqrMagnitude ? RiseRate : Follow;
-        return Vector3.Lerp(current, target, 1f - Mathf.Exp(-rate * dt));
+        var rate = target.LengthSquared() > current.LengthSquared() ? RiseRate : Follow;
+        return NV.Lerp(current, target, 1f - MathF.Exp(-rate * dt));
     }
 
     // What the arm ran into since the last report (centimeters), for the log.
@@ -732,36 +790,38 @@ internal sealed class Hand
         return r;
     }
 
-    private static Vector3 Trim(Vector3 push, float k)
+    private static NV Trim(NV push, float k)
     {
-        var depth = push.magnitude;
-        return depth > Allowed * k ? push * ((depth - Allowed * k) / depth) : Vector3.zero;
-    }
-
-    private static void Deepest(BodySurface body, Vector3 p, float margin, float reach, ref Vector3 best)
-    {
-        if (body.Depth(p, margin, reach, out var push) && push.sqrMagnitude > best.sqrMagnitude) best = push;
+        var depth = push.Length();
+        return depth > Allowed * k ? push * ((depth - Allowed * k) / depth) : NV.Zero;
     }
 
     // Two-bone reach: the hand to its target with its own rotation kept, the elbow bending towards where it
     // should be (where the clip had it, unless it was pushed out).
-    private void Reach(Vector3 target, Vector3 elbowHint)
+    private void Reach(NV target, NV elbowHint)
     {
-        var handRot = _hand.rotation;
-        Vector3 a = _upper.position, b = _lower.position, c = _hand.position;
-        float l1 = (b - a).magnitude, l2 = (c - b).magnitude;
+        var handRot = Fast.N(_hand.rotation);
+        var lowerRot = Fast.N(_lower.rotation);
+        NV a = Fast.N(_upper.position), b = Fast.N(_lower.position), c = Fast.N(_hand.position);
+        float l1 = (b - a).Length(), l2 = (c - b).Length();
         var at = target - a;
-        var d = Mathf.Clamp(at.magnitude, Mathf.Abs(l1 - l2) + 1e-3f, l1 + l2 - 1e-3f);
-        var dir = at.normalized;
-        var pole = (elbowHint - a) - Vector3.Project(elbowHint - a, dir);
-        if (pole.sqrMagnitude < 1e-8f) pole = (b - a) - Vector3.Project(b - a, dir);
-        if (pole.sqrMagnitude < 1e-8f) return;
-        pole.Normalize();
-        var cosA = Mathf.Clamp((l1 * l1 + d * d - l2 * l2) / (2f * l1 * d), -1f, 1f);
-        var elbow = a + (dir * cosA + pole * Mathf.Sqrt(1f - cosA * cosA)) * l1;
-        _upper.rotation = Quaternion.FromToRotation(b - a, elbow - a) * _upper.rotation;
-        var b1 = _lower.position;
-        _lower.rotation = Quaternion.FromToRotation(_hand.position - b1, a + dir * d - b1) * _lower.rotation;
-        _hand.rotation = handRot;
+        var d = Fast.Clamp(at.Length(), Math.Abs(l1 - l2) + 1e-3f, l1 + l2 - 1e-3f);
+        var dir = Fast.Normalized(at);
+        var pole = (elbowHint - a) - Fast.Project(elbowHint - a, dir);
+        if (pole.LengthSquared() < 1e-8f) pole = (b - a) - Fast.Project(b - a, dir);
+        if (pole.LengthSquared() < 1e-8f) return;
+        pole = NV.Normalize(pole);
+        var cosA = Fast.Clamp((l1 * l1 + d * d - l2 * l2) / (2f * l1 * d), -1f, 1f);
+        var elbow = a + (dir * cosA + pole * MathF.Sqrt(1f - cosA * cosA)) * l1;
+        _upper.rotation = Fast.U(Fast.FromTo(b - a, elbow - a) * Fast.N(_upper.rotation));
+        var b1 = Fast.N(_lower.position);
+        var newLower = Fast.FromTo(Fast.N(_hand.position) - b1, a + dir * d - b1) * Fast.N(_lower.rotation);
+        _lower.rotation = Fast.U(newLower);
+        // Keeping the hand exactly as it was would twist her wrist once the forearm swings far: past a point the
+        // hand turns along with the forearm instead.
+        var swing = newLower * NQ.Inverse(lowerRot);
+        var angle = 2f * MathF.Acos(Math.Min(1f, Math.Abs(swing.W))) * 180f / MathF.PI;
+        var follow = Fast.Clamp01((angle - KeepWristUpTo) / (FollowForearmFrom - KeepWristUpTo));
+        _hand.rotation = Fast.U(follow > 0f ? Fast.Slerp(handRot, swing * handRot, follow) : handRot);
     }
 }
